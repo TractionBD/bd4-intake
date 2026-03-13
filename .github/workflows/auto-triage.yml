@@ -8,10 +8,16 @@ permissions:
   issues: write
   contents: read
 
+concurrency:
+  group: triage-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: contains(github.event.issue.labels.*.name, 'needs-triage')
+    if: |
+      contains(github.event.issue.labels.*.name, 'needs-triage') &&
+      !contains(github.event.issue.labels.*.name, 'triaged')
 
     steps:
       - name: Triage with AI

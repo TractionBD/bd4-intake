@@ -23,9 +23,14 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_BUGTRIAGE }}
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            // Create a separate Octokit client with PAT for cross-repo operations
+            const { Octokit } = require('@octokit/rest');
+            const crossRepoOctokit = new Octokit({ auth: process.env.CROSS_REPO_TOKEN });
+
             const issue = context.payload.issue;
             const body = issue.body || '';
             const title = issue.title || '';
@@ -163,10 +168,10 @@ jobs:
               return;
             }
 
-            // Create sub-issues in target repos
+            // Create sub-issues in target repos using PAT for cross-repo access
             const subIssueLinks = [];
             for (const sub of triage.repos) {
-              const created = await github.rest.issues.create({
+              const created = await crossRepoOctokit.issues.create({
                 owner: 'TractionBD',
                 repo: sub.repo,
                 title: sub.title,

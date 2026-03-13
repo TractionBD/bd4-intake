@@ -177,11 +177,14 @@ jobs:
 
               // Notify Slack if webhook is configured
               if (process.env.SLACK_WEBHOOK_URL) {
+                const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+                const submitter = issue.user?.login || 'unknown';
+                const bestGuess = triage.repos.map(r => `• \`${r.repo}\`: ${r.title}`).join('\n');
                 await fetch(process.env.SLACK_WEBHOOK_URL, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    text: `🔍 *Bug needs human triage:* <${issue.html_url}|${title}>\nAI confidence: low\nReasoning: ${triage.reasoning}`
+                    text: `🔍 *Bug needs human triage*\n*Issue:* <${issue.html_url}|bd4-intake#${issue.number}> — ${title}\n*Submitted by:* ${submitter}\n*Time:* ${timestamp}\n*Confidence:* ${triage.confidence}\n*Reasoning:* ${triage.reasoning}\n*Best guess:*\n${bestGuess}`
                   })
                 });
               }
@@ -227,11 +230,14 @@ jobs:
 
             // Notify Slack for all triaged bugs
             if (process.env.SLACK_WEBHOOK_URL) {
+              const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+              const submitter = issue.user?.login || 'unknown';
+              const subIssueSummary = subIssueLinks.map(l => `• ${l.replace('- [ ] ', '')}`).join('\n');
               await fetch(process.env.SLACK_WEBHOOK_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                  text: `🐛 *New bug auto-triaged:* <${issue.html_url}|${title}>\nSeverity: ${severity}\nRouted to: ${triage.repos.map(r => r.repo).join(', ')}`
+                  text: `🐛 *Bug auto-triaged*\n*Issue:* <${issue.html_url}|bd4-intake#${issue.number}> — ${title}\n*Submitted by:* ${submitter}\n*Time:* ${timestamp}\n*Severity:* ${severity}\n*Sub-issues created:*\n${subIssueSummary}`
                 })
               });
             }

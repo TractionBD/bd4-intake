@@ -27,9 +27,23 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // Create a separate Octokit client with PAT for cross-repo operations
-            const { Octokit } = require('@octokit/rest');
-            const crossRepoOctokit = new Octokit({ auth: process.env.CROSS_REPO_TOKEN });
+            // Helper: create issue in another repo using PAT
+            async function createCrossRepoIssue(repo, title, body, labels) {
+              const res = await fetch(`https://api.github.com/repos/TractionBD/${repo}/issues`, {
+                method: 'POST',
+                headers: {
+                  'Accept': 'application/vnd.github.v3+json',
+                  'Authorization': `token ${process.env.CROSS_REPO_TOKEN}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ title, body, labels })
+              });
+              if (!res.ok) {
+                const err = await res.text();
+                throw new Error(`Failed to create issue in ${repo}: ${res.status} ${err}`);
+              }
+              return res.json();
+            }
 
             const issue = context.payload.issue;
             const body = issue.body || '';
@@ -171,14 +185,13 @@ jobs:
             // Create sub-issues in target repos using PAT for cross-repo access
             const subIssueLinks = [];
             for (const sub of triage.repos) {
-              const created = await crossRepoOctokit.issues.create({
-                owner: 'TractionBD',
-                repo: sub.repo,
-                title: sub.title,
-                body: `Parent: TractionBD/bd4-intake#${issue.number}\n\n**Reason:** ${sub.reason}\n\n---\n*Original bug report:*\n\n> ${title}\n\n${body}`,
-                labels: ['bug', priorityLabel]
-              });
-              subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.data.number} — ${sub.title}`);
+              const created = await createCrossRepoIssue(
+                sub.repo,
+                sub.title,
+                `Parent: TractionBD/bd4-intake#${issue.number}\n\n**Reason:** ${sub.reason}\n\n---\n*Original bug report:*\n\n> ${title}\n\n${body}`,
+                ['bug', priorityLabel]
+              );
+              subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title}`);
             }
 
             // Update intake issue with sub-issue links

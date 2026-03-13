@@ -1,0 +1,213 @@
+name: Auto-Triage Bug Report
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'needs-triage')
+
+    steps:
+      - name: Triage with AI
+        uses: actions/github-script@v7
+        env:
+          # --- LLM Provider Config ---
+          # To switch to Claude: set LLM_PROVIDER to "anthropic" and add ANTHROPIC_API_KEY secret
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'openai' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const title = issue.title || '';
+
+            // Parse form fields from issue body
+            const areaMatch = body.match(/### Where is the issue\?\s*\n\s*(.+)/);
+            const severityMatch = body.match(/### Severity\s*\n\s*(.+)/);
+            const area = areaMatch ? areaMatch[1].trim() : 'Not sure';
+            const severity = severityMatch ? severityMatch[1].trim() : 'Medium';
+
+            // Map severity to priority label
+            const priorityMap = {
+              'Blocker (can\'t use the app)': 'priority:urgent',
+              'High (major feature broken)': 'priority:high',
+              'Medium (annoying but workaround exists)': 'priority:medium',
+              'Low (cosmetic or minor)': 'priority:low'
+            };
+            const priorityLabel = priorityMap[severity] || 'priority:medium';
+
+            // Add priority label to intake issue
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: [priorityLabel]
+            });
+
+            // Build prompt for AI triage
+            const systemPrompt = `You are a bug triage assistant for BD4, a relationship-driven professional CRM.
+
+            The product has these repositories:
+            - tbd-frontend: Flutter mobile app (iOS/Android). Owns all UI screens, navigation, state management, and user-facing interactions.
+            - tbd-bff: Next.js BFF (Backend-For-Frontend). Middleware that sits between the mobile app and the backend API. Handles request aggregation, caching, and auth forwarding.
+            - tbd-backend: FastAPI Python backend. Owns all business logic, database operations, Celery background tasks, enrichment pipelines, and external API integrations.
+            - tbd-design: Design specs, Figma references, and UI/UX documentation.
+
+            When a bug is reported, determine which repo(s) need sub-issues. Consider:
+            - Visual/UI bugs → tbd-frontend
+            - Data not loading or wrong data → could be tbd-backend (API) or tbd-bff (caching/routing)
+            - Authentication issues → tbd-backend (auth service)
+            - Slow performance → could be any layer
+            - "Button not working" → check if it's a UI handler (frontend) or API failure (backend)
+
+            Respond in JSON format:
+            {
+              "confidence": "high" | "medium" | "low",
+              "repos": [{"repo": "tbd-frontend|tbd-bff|tbd-backend", "title": "sub-issue title", "reason": "why this repo"}],
+              "reasoning": "brief explanation of your triage decision"
+            }
+
+            If confidence is "low", still provide your best guess in repos but we will flag it for human review.
+            Only include repos that genuinely need work. Most bugs are single-repo.`;
+
+            const userPrompt = `Bug Report:
+            Title: ${title}
+            Area reported by user: ${area}
+            Severity: ${severity}
+            Description:
+            ${body}`;
+
+            // --- LLM Call (provider-agnostic) ---
+            let aiResponse;
+            const provider = process.env.LLM_PROVIDER || 'openai';
+
+            if (provider === 'anthropic') {
+              const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': process.env.ANTHROPIC_API_KEY,
+                  'anthropic-version': '2023-06-01'
+                },
+                body: JSON.stringify({
+                  model: 'claude-sonnet-4-20250514',
+                  max_tokens: 1024,
+                  system: systemPrompt,
+                  messages: [{ role: 'user', content: userPrompt }]
+                })
+              });
+              const anthropicData = await anthropicRes.json();
+              aiResponse = anthropicData.content[0].text;
+            } else {
+              const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o',
+                  response_format: { type: 'json_object' },
+                  messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                  ]
+                })
+              });
+              const openaiData = await openaiRes.json();
+              aiResponse = openaiData.choices[0].message.content;
+            }
+
+            let triage;
+            try {
+              triage = JSON.parse(aiResponse);
+            } catch (e) {
+              // If AI response isn't valid JSON, flag for human triage
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `⚠️ **Auto-triage failed** — could not parse AI response. Please triage manually.\n\nRaw response:\n\`\`\`\n${aiResponse}\n\`\`\``
+              });
+              return;
+            }
+
+            // If low confidence, flag for human and notify Slack
+            if (triage.confidence === 'low') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `🔍 **Needs human triage** — AI confidence is low.\n\n**AI reasoning:** ${triage.reasoning}\n\n**Best guess:**\n${triage.repos.map(r => `- \`${r.repo}\`: ${r.title} (${r.reason})`).join('\n')}\n\nPlease review and create sub-issues manually, or confirm the AI suggestion.`
+              });
+
+              // Notify Slack if webhook is configured
+              if (process.env.SLACK_WEBHOOK_URL) {
+                await fetch(process.env.SLACK_WEBHOOK_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    text: `🔍 *Bug needs human triage:* <${issue.html_url}|${title}>\nAI confidence: low\nReasoning: ${triage.reasoning}`
+                  })
+                });
+              }
+              return;
+            }
+
+            // Create sub-issues in target repos
+            const subIssueLinks = [];
+            for (const sub of triage.repos) {
+              const created = await github.rest.issues.create({
+                owner: 'TractionBD',
+                repo: sub.repo,
+                title: sub.title,
+                body: `Parent: TractionBD/bd4-intake#${issue.number}\n\n**Reason:** ${sub.reason}\n\n---\n*Original bug report:*\n\n> ${title}\n\n${body}`,
+                labels: ['bug', priorityLabel]
+              });
+              subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.data.number} — ${sub.title}`);
+            }
+
+            // Update intake issue with sub-issue links
+            const triageComment = `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: triageComment
+            });
+
+            // Remove needs-triage label, add triaged
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              name: 'needs-triage'
+            }).catch(() => {});
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: ['triaged']
+            });
+
+            // Notify Slack for all triaged bugs
+            if (process.env.SLACK_WEBHOOK_URL) {
+              await fetch(process.env.SLACK_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  text: `🐛 *New bug auto-triaged:* <${issue.html_url}|${title}>\nSeverity: ${severity}\nRouted to: ${triage.repos.map(r => r.repo).join(', ')}`
+                })
+              });
+            }

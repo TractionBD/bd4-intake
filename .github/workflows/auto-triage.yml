@@ -166,13 +166,13 @@ jobs:
               return;
             }
 
-            // If low confidence, flag for human and notify Slack
-            if (triage.confidence === 'low') {
+            // If not high confidence, flag for human and notify Slack
+            if (triage.confidence !== 'high') {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: `🔍 **Needs human triage** — AI confidence is low.\n\n**AI reasoning:** ${triage.reasoning}\n\n**Best guess:**\n${triage.repos.map(r => `- \`${r.repo}\`: ${r.title} (${r.reason})`).join('\n')}\n\nPlease review and create sub-issues manually, or confirm the AI suggestion.`
+                body: `🔍 **Needs human triage** — AI confidence is ${triage.confidence}.\n\n**AI reasoning:** ${triage.reasoning}\n\n**Best guess:**\n${triage.repos.map(r => `- \`${r.repo}\`: ${r.title} (${r.reason})`).join('\n')}\n\nPlease review and create sub-issues manually, or confirm the AI suggestion.`
               });
 
               // Notify Slack if webhook is configured

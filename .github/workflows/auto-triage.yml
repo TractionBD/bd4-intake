@@ -225,7 +225,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issue.number,
-              labels: ['triaged']
+              labels: ['triaged', 'tracking']
             });
 
             // Notify Slack for all triaged bugs

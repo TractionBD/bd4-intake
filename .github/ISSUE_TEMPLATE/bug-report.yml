@@ -1,7 +1,7 @@
 name: Bug Report
 description: Report a bug or issue with BD4
 title: "[Bug]: "
-labels: ["bug", "needs-triage"]
+labels: ["bug", "needs-triage", "tracking"]
 body:
   - type: markdown
     attributes:
@@ -51,6 +51,18 @@ body:
         - Low (cosmetic or minor)
     validations:
       required: true
+
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Milestone
+      description: Which release should this be fixed in?
+      options:
+        - MVP
+        - v1
+        - Unplanned
+    validations:
+      required: false
 
   - type: textarea
     id: screenshots

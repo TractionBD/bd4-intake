@@ -1,0 +1,58 @@
+name: Feature Request
+description: Suggest a new feature or enhancement for BD4
+title: ""
+labels: ["feature", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for BD4? Tell us what you'd like to see!
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What would you like?
+      description: Describe the feature or improvement.
+      placeholder: |
+        I'd like to be able to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is this important?
+      description: How would this help you or other users?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does this belong?
+      options:
+        - Mobile App
+        - Website
+        - Backend / API
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is this to you?
+      options:
+        - Critical (blocking my workflow)
+        - Important (would use regularly)
+        - Nice to have
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Mockups or examples
+      description: Drag and drop images, sketches, or links to examples.
+    validations:
+      required: false

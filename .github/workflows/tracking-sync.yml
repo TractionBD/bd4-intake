@@ -1,0 +1,201 @@
+name: Tracking Issue Status Sync
+
+on:
+  # Trigger when project items change status
+  issues:
+    types: [opened, closed, reopened, labeled]
+  # Also run on a schedule to catch project field changes (GitHub doesn't have a native project item event)
+  schedule:
+    - cron: '*/15 * * * *'  # Every 15 minutes
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sync-tracking-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync tracking issue statuses
+        uses: actions/github-script@v7
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        with:
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+          script: |
+            const PROJECT_ID = 'PVT_kwDODvlY_84BRmQU';
+            const STATUS_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YSso';
+            const STATUS_OPTIONS = {
+              'Backlog':     '12573c5f',
+              'Design':      '49bda7c5',
+              'Ready':       '7f347fdd',
+              'In Progress': '83e0096a',
+              'In Review':   '7463245c',
+              'Done':        '9cfae556'
+            };
+
+            // Status ordering for "further along" comparison
+            const STATUS_ORDER = {
+              'Backlog': 0, 'Design': 1, 'Ready': 2,
+              'In Progress': 3, 'In Review': 4, 'Done': 5
+            };
+
+            // Statuses that should be promoted to Ready when tracking moves to Ready
+            const PROMOTABLE_TO_READY = new Set(['Backlog', 'Design']);
+
+            // Helper: get all project items with status
+            async function getProjectItems() {
+              const query = `query($cursor: String) {
+                organization(login: "tractionbd") {
+                  projectV2(number: 1) {
+                    items(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        status: fieldValueByName(name: "Status") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        }
+                        content {
+                          ... on Issue {
+                            id
+                            number
+                            title
+                            state
+                            repository { name nameWithOwner }
+                            labels(first: 10) { nodes { name } }
+                            subIssues(first: 20) {
+                              nodes {
+                                id
+                                number
+                                title
+                                state
+                                repository { name nameWithOwner }
+                              }
+                            }
+                            trackedInIssues(first: 5) {
+                              nodes {
+                                id
+                                number
+                                repository { name nameWithOwner }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+              let items = [];
+              let cursor = null;
+              do {
+                const result = await github.graphql(query, { cursor });
+                const page = result.organization.projectV2.items;
+                items = items.concat(page.nodes);
+                cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+              } while (cursor);
+              return items;
+            }
+
+            // Helper: update project item status
+            async function setProjectItemStatus(itemId, statusName) {
+              const optionId = STATUS_OPTIONS[statusName];
+              if (!optionId) {
+                console.log(`Unknown status: ${statusName}`);
+                return;
+              }
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }
+              `, {
+                projectId: PROJECT_ID,
+                itemId: itemId,
+                fieldId: STATUS_FIELD_ID,
+                optionId: optionId
+              });
+              console.log(`  → Updated to ${statusName}`);
+            }
+
+            // Helper: find project item by issue node ID
+            function findProjectItem(items, issueNodeId) {
+              return items.find(i => i.content?.id === issueNodeId);
+            }
+
+            // Main logic
+            const allItems = await getProjectItems();
+            console.log(`Found ${allItems.length} project items`);
+
+            // Find tracking issues (in bd4-intake with 'tracking' label and sub-issues)
+            const trackingItems = allItems.filter(item => {
+              const content = item.content;
+              if (!content) return false;
+              const isIntake = content.repository?.name === 'bd4-intake';
+              const hasTracking = content.labels?.nodes?.some(l => l.name === 'tracking');
+              const hasSubs = content.subIssues?.nodes?.length > 0;
+              return isIntake && hasTracking && hasSubs;
+            });
+
+            console.log(`Found ${trackingItems.length} tracking issues with sub-issues`);
+
+            for (const tracking of trackingItems) {
+              const trackingStatus = tracking.status?.name;
+              const subIssues = tracking.content.subIssues.nodes;
+              const trackingNum = tracking.content.number;
+
+              console.log(`\n#${trackingNum} "${tracking.content.title}" [${trackingStatus}] — ${subIssues.length} sub-issues`);
+
+              // Get sub-issue statuses from project
+              const subStatuses = [];
+              for (const sub of subIssues) {
+                const subItem = findProjectItem(allItems, sub.id);
+                const subStatus = subItem?.status?.name || (sub.state === 'CLOSED' ? 'Done' : 'Backlog');
+                subStatuses.push({ ...sub, projectItem: subItem, status: subStatus });
+                console.log(`  Sub #${sub.number} (${sub.repository.name}) [${subStatus}]`);
+              }
+
+              // RULE 1: When tracking is Ready, promote sub-issues from Backlog/Design to Ready
+              if (trackingStatus === 'Ready') {
+                for (const sub of subStatuses) {
+                  if (sub.projectItem && PROMOTABLE_TO_READY.has(sub.status)) {
+                    console.log(`  Promoting #${sub.number} from ${sub.status} → Ready`);
+                    await setProjectItemStatus(sub.projectItem.id, 'Ready');
+                  }
+                }
+              }
+
+              // RULE 2: If any sub-issue is In Progress (or beyond), move tracking to In Progress
+              // Only if tracking is currently behind In Progress
+              const anyInProgressOrBeyond = subStatuses.some(s =>
+                STATUS_ORDER[s.status] >= STATUS_ORDER['In Progress'] && s.status !== 'Done'
+              );
+              if (anyInProgressOrBeyond && STATUS_ORDER[trackingStatus] < STATUS_ORDER['In Progress']) {
+                console.log(`  Moving tracking #${trackingNum} → In Progress (sub-issue is active)`);
+                await setProjectItemStatus(tracking.id, 'In Progress');
+              }
+
+              // RULE 3: If ALL sub-issues are Done, move tracking to Done
+              const allDone = subStatuses.length > 0 && subStatuses.every(s => s.status === 'Done');
+              if (allDone && trackingStatus !== 'Done') {
+                console.log(`  Moving tracking #${trackingNum} → Done (all sub-issues complete)`);
+                await setProjectItemStatus(tracking.id, 'Done');
+                // Also close the GitHub issue
+                await github.rest.issues.update({
+                  owner: 'TractionBD',
+                  repo: 'bd4-intake',
+                  issue_number: trackingNum,
+                  state: 'closed',
+                  state_reason: 'completed'
+                });
+                console.log(`  Closed bd4-intake#${trackingNum}`);
+              }
+            }
+
+            console.log('\nSync complete.');

@@ -198,4 +198,56 @@ jobs:
               }
             }
 
+            // === PRIORITY LABEL → PROJECT FIELD SYNC ===
+            const PRIORITY_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YTuA';
+            const PRIORITY_OPTIONS = {
+              'priority:urgent': 'ee8aa970',
+              'priority:high':   'e5ba6df9',
+              'priority:medium': '3f9bcc8d',
+              'priority:low':    'a59d52d9'
+            };
+
+            console.log('\n--- Priority label sync ---');
+            for (const item of allItems) {
+              const content = item.content;
+              if (!content || !content.labels) continue;
+
+              const labelNames = content.labels.nodes.map(l => l.name);
+              const priorityLabel = labelNames.find(l => l.startsWith('priority:'));
+              if (!priorityLabel) continue;
+
+              const optionId = PRIORITY_OPTIONS[priorityLabel];
+              if (!optionId) continue;
+
+              try {
+                await github.graphql(`
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { singleSelectOptionId: $optionId }
+                    }) { projectV2Item { id } }
+                  }
+                `, {
+                  projectId: PROJECT_ID,
+                  itemId: item.id,
+                  fieldId: PRIORITY_FIELD_ID,
+                  optionId: optionId
+                });
+
+                const repo = content.repository.nameWithOwner.split('/');
+                await github.rest.issues.removeLabel({
+                  owner: repo[0],
+                  repo: repo[1],
+                  issue_number: content.number,
+                  name: priorityLabel
+                }).catch(() => {});
+
+                console.log(`  #${content.number} (${content.repository.name}): ${priorityLabel} → Priority field, label removed`);
+              } catch (e) {
+                console.log(`  #${content.number}: failed to sync priority — ${e.message}`);
+              }
+            }
+
             console.log('\nSync complete.');

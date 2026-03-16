@@ -6,7 +6,7 @@ on:
     types: [opened, closed, reopened, labeled]
   # Also run on a schedule to catch project field changes (GitHub doesn't have a native project item event)
   schedule:
-    - cron: '*/15 * * * *'  # Every 15 minutes
+    - cron: '0 * * * *'  # Hourly fallback (event-driven sync in TractionBD/.github)
   workflow_dispatch: {}
 
 permissions:

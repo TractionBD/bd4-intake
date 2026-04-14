@@ -27,22 +27,23 @@ jobs:
             const PROJECT_ID = 'PVT_kwDODvlY_84BRmQU';
             const STATUS_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YSso';
             const STATUS_OPTIONS = {
-              'Backlog':     '12573c5f',
-              'Design':      '49bda7c5',
-              'Ready':       '7f347fdd',
-              'In Progress': '83e0096a',
-              'In Review':   '7463245c',
-              'Done':        '9cfae556'
+              'Backlog':     'a9b5279c',
+              'Design':      '920a29e4',
+              'Triage':      'f0a0aebb',
+              'Ready':       '45de947b',
+              'In Progress': 'ec09aae4',
+              'In Review':   '546b9235',
+              'Done':        'df73bb56'
             };
 
             // Status ordering for "further along" comparison
             const STATUS_ORDER = {
-              'Backlog': 0, 'Design': 1, 'Ready': 2,
-              'In Progress': 3, 'In Review': 4, 'Done': 5
+              'Backlog': 0, 'Design': 1, 'Triage': 2, 'Ready': 3,
+              'In Progress': 4, 'In Review': 5, 'Done': 6
             };
 
             // Statuses that should be promoted to Ready when tracking moves to Ready
-            const PROMOTABLE_TO_READY = new Set(['Backlog', 'Design']);
+            const PROMOTABLE_TO_READY = new Set(['Backlog', 'Design', 'Triage']);
 
             // Helper: get all project items with status
             async function getProjectItems() {

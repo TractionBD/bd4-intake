@@ -1,0 +1,455 @@
+name: Enhanced Triage
+
+on:
+  # Real-time: fires when a project card is edited (e.g., moved to Triage)
+  projects_v2_item:
+    types: [edited]
+  # Fallback: catch anything missed
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: enhanced-triage
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    # Only run for BD4 project events, or on schedule/manual
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'projects_v2_item' &&
+       github.event.projects_v2_item.project_node_id == 'PVT_kwDODvlY_84BRmQU')
+
+    steps:
+      - name: Triage items in Triage status
+        uses: actions/github-script@v7
+        env:
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'openai' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_BUGTRIAGE }}
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        with:
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+          script: |
+            const PROJECT_ID = 'PVT_kwDODvlY_84BRmQU';
+            const STATUS_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YSso';
+            const PRIORITY_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YTuA';
+            const STATUS_OPTIONS = {
+              'Backlog':     'a9b5279c',
+              'Design':      '920a29e4',
+              'Triage':      'f0a0aebb',
+              'Ready':       '45de947b',
+              'In Progress': 'ec09aae4',
+              'In Review':   '546b9235',
+              'Done':        'df73bb56'
+            };
+            const PRIORITY_OPTIONS = {
+              'Urgent': 'ee8aa970',
+              'High':   'e5ba6df9',
+              'Medium': '3f9bcc8d',
+              'Low':    'a59d52d9'
+            };
+            const MAX_RETRIES = 3;
+
+            // Helper: create issue in another repo using PAT
+            async function createCrossRepoIssue(repo, title, body, labels, assignees = []) {
+              const payload = { title, body, labels };
+              if (assignees.length > 0) payload.assignees = assignees;
+              const res = await fetch(`https://api.github.com/repos/TractionBD/${repo}/issues`, {
+                method: 'POST',
+                headers: {
+                  'Accept': 'application/vnd.github.v3+json',
+                  'Authorization': `token ${process.env.CROSS_REPO_TOKEN}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+              });
+              if (!res.ok) {
+                const err = await res.text();
+                throw new Error(`Failed to create issue in ${repo}: ${res.status} ${err}`);
+              }
+              return res.json();
+            }
+
+            // Helper: get all project items
+            async function getProjectItems() {
+              const query = `query($cursor: String) {
+                organization(login: "tractionbd") {
+                  projectV2(number: 1) {
+                    items(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        status: fieldValueByName(name: "Status") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        }
+                        priority: fieldValueByName(name: "Priority") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { name }
+                        }
+                        content {
+                          ... on Issue {
+                            id number title body state
+                            repository { name nameWithOwner }
+                            labels(first: 10) { nodes { name } }
+                            subIssues(first: 20) { nodes { id number } }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+              let items = [];
+              let cursor = null;
+              do {
+                const result = await github.graphql(query, { cursor });
+                const page = result.organization.projectV2.items;
+                items = items.concat(page.nodes);
+                cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+              } while (cursor);
+              return items;
+            }
+
+            // Helper: set project item status
+            async function setStatus(itemId, statusName) {
+              const optionId = STATUS_OPTIONS[statusName];
+              if (!optionId) return;
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                    value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }
+              `, { projectId: PROJECT_ID, itemId: itemId, fieldId: STATUS_FIELD_ID, optionId });
+            }
+
+            // Helper: add issue to project and set status
+            async function addToProjectWithStatus(nodeId, statusName, priorityName) {
+              const result = await github.graphql(`
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                    item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, contentId: nodeId });
+              const itemId = result.addProjectV2ItemById.item.id;
+              await setStatus(itemId, statusName);
+              if (priorityName && PRIORITY_OPTIONS[priorityName]) {
+                await github.graphql(`
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                      value: { singleSelectOptionId: $optionId }
+                    }) { projectV2Item { id } }
+                  }
+                `, { projectId: PROJECT_ID, itemId: itemId, fieldId: PRIORITY_FIELD_ID, optionId: PRIORITY_OPTIONS[priorityName] });
+              }
+              return itemId;
+            }
+
+            // Helper: get frontend dev with fewest active issues
+            async function getLeastBusyFrontendDev() {
+              const devs = ['dhairyahp', 'manpreet-rgb'];
+              const counts = {};
+              for (const dev of devs) {
+                const result = await github.graphql(`
+                  query($login: String!) {
+                    user(login: $login) {
+                      issues(first: 100, states: OPEN, filterBy: { assignee: $login }) {
+                        totalCount
+                      }
+                    }
+                  }
+                `, { login: dev });
+                counts[dev] = result.user.issues.totalCount;
+              }
+              return counts[devs[0]] <= counts[devs[1]] ? devs[0] : devs[1];
+            }
+
+            // Helper: call LLM
+            async function callLLM(systemPrompt, userPrompt) {
+              const provider = process.env.LLM_PROVIDER || 'openai';
+              if (provider === 'anthropic') {
+                const res = await fetch('https://api.anthropic.com/v1/messages', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': process.env.ANTHROPIC_API_KEY,
+                    'anthropic-version': '2023-06-01'
+                  },
+                  body: JSON.stringify({
+                    model: 'claude-sonnet-4-20250514',
+                    max_tokens: 2048,
+                    system: systemPrompt,
+                    messages: [{ role: 'user', content: userPrompt }]
+                  })
+                });
+                const data = await res.json();
+                return data.content[0].text;
+              } else {
+                const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                  },
+                  body: JSON.stringify({
+                    model: 'gpt-4o',
+                    response_format: { type: 'json_object' },
+                    messages: [
+                      { role: 'system', content: systemPrompt },
+                      { role: 'user', content: userPrompt }
+                    ]
+                  })
+                });
+                const data = await res.json();
+                return data.choices[0].message.content;
+              }
+            }
+
+            // Helper: notify Slack
+            async function notifySlack(text) {
+              if (!process.env.SLACK_WEBHOOK_URL) return;
+              await fetch(process.env.SLACK_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+              });
+            }
+
+            // ============================================================
+            // MAIN LOGIC
+            // ============================================================
+
+            const allItems = await getProjectItems();
+            console.log(`Found ${allItems.length} project items`);
+
+            // Find items in Triage status that haven't been triaged yet
+            const triageItems = allItems.filter(item => {
+              const content = item.content;
+              if (!content || !content.title) return false;
+              if (item.status?.name !== 'Triage') return false;
+              // Skip if already triaged (has sub-issues)
+              if (content.subIssues?.nodes?.length > 0) return false;
+              // Skip if already has 'triaged' label
+              if (content.labels?.nodes?.some(l => l.name === 'triaged')) return false;
+              return true;
+            });
+
+            console.log(`Found ${triageItems.length} items needing triage`);
+
+            if (triageItems.length === 0) {
+              console.log('Nothing to triage. Exiting.');
+              return;
+            }
+
+            const SYSTEM_PROMPT = `You are a technical triage assistant for BD4, a relationship-driven professional CRM.
+
+            Your job is to evaluate issues for development readiness and determine which repository/repositories need work.
+
+            ## Repositories
+            - tbd-frontend: Flutter mobile app (iOS/Android). UI screens, navigation, state management.
+            - tbd-bff: Next.js BFF. Middleware between mobile app and backend API.
+            - tbd-backend: FastAPI Python backend. Business logic, database, Celery tasks, enrichment, external APIs.
+
+            ## Assignment Rules
+            - tbd-backend or tbd-bff work → assign to "kul-pointe"
+            - tbd-frontend work → assign to the frontend dev specified in the prompt
+
+            ## Your evaluation must cover:
+
+            1. **Design check**: Does this issue describe work that needs NEW visual UI/UX design?
+               - Backend fixes, config changes, API changes, text updates → NO design needed
+               - New screens, new UI flows, significant layout changes → YES design needed
+               - If design IS needed: are mockups/Figma links/screenshots referenced in the description?
+               - If design is NOT needed: skip this check
+
+            2. **Clarity check**: Is the issue clear enough for a developer to start work?
+               - Are there unresolved questions (TBD, "need to decide", "check with")?
+               - Are acceptance criteria or expected behavior described?
+
+            3. **Dependency check**: Does this depend on other work that isn't done?
+               - References to other issues that might need to be completed first?
+
+            4. **Repo analysis**: Which repo(s) need sub-issues?
+               - Create ONE sub-issue per repo (not per task within a repo)
+               - Each sub-issue should describe ALL the work needed in that repo
+
+            Respond in JSON:
+            {
+              "readiness": {
+                "ready": true/false,
+                "issues": ["list of readiness problems, empty if ready"]
+              },
+              "needsDesign": true/false,
+              "designAttached": true/false,
+              "confidence": "high" | "medium" | "low",
+              "repos": [
+                {
+                  "repo": "tbd-frontend|tbd-bff|tbd-backend",
+                  "title": "concise sub-issue title describing the work for this repo",
+                  "description": "detailed description of what needs to be done in this repo",
+                  "assignee": "github username per assignment rules"
+                }
+              ],
+              "reasoning": "brief explanation of your triage decision",
+              "isSingleRepo": true/false,
+              "isSingleTask": true/false
+            }`;
+
+            const leastBusyFrontendDev = await getLeastBusyFrontendDev();
+            console.log(`Least busy frontend dev: ${leastBusyFrontendDev}`);
+
+            for (const item of triageItems) {
+              const content = item.content;
+              const issueNum = content.number;
+              const repo = content.repository.name;
+              const repoFull = content.repository.nameWithOwner;
+              const [owner, repoName] = repoFull.split('/');
+              const labels = content.labels?.nodes?.map(l => l.name) || [];
+              const priority = item.priority?.name || 'Medium';
+
+              console.log(`\nTriaging #${issueNum}: ${content.title}`);
+
+              // Check retry count from existing comments
+              const comments = await github.rest.issues.listComments({
+                owner, repo: repoName, issue_number: issueNum, per_page: 10
+              });
+              const retryCount = comments.data.filter(c =>
+                c.body?.includes('Auto-triage failed') && c.user?.login === 'github-actions[bot]'
+              ).length;
+
+              if (retryCount >= MAX_RETRIES) {
+                console.log(`  Skipping — ${retryCount} failed attempts. Flagged for manual triage.`);
+                continue;
+              }
+
+              // Call LLM
+              let triage;
+              try {
+                const userPrompt = `Issue #${issueNum}: ${content.title}
+
+            Labels: ${labels.join(', ')}
+            Priority: ${priority}
+
+            Description:
+            ${content.body || '(no description)'}
+
+            Frontend dev to assign: ${leastBusyFrontendDev}`;
+
+                const response = await callLLM(SYSTEM_PROMPT, userPrompt);
+                triage = JSON.parse(response);
+              } catch (e) {
+                console.log(`  LLM error: ${e.message}`);
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum,
+                  body: `⚠️ **Auto-triage failed** (attempt ${retryCount + 1}/${MAX_RETRIES}) — ${e.message}\n\nWill retry on next cycle.`
+                });
+                continue;
+              }
+
+              // === READINESS CHECK ===
+              if (!triage.readiness?.ready) {
+                const issues = triage.readiness?.issues?.join('\n- ') || 'Unknown readiness issues';
+                let comment = `🔍 **Readiness check failed** — this item needs attention before it can move to Ready:\n\n- ${issues}\n\n`;
+
+                if (triage.needsDesign && !triage.designAttached) {
+                  comment += `📐 **Design needed but not attached.** Please add Figma/mockup links, or comment "no design needed" if this is intentional.\n\n`;
+                }
+
+                comment += `**AI reasoning:** ${triage.reasoning}\n\n---\n*Once the issues above are resolved, the next triage cycle will re-evaluate this item.*`;
+
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum, body: comment
+                });
+
+                await notifySlack(`🔍 *Readiness check failed*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Issues:* ${triage.readiness.issues.join(', ')}`);
+
+                console.log(`  Readiness failed: ${triage.readiness.issues.join(', ')}`);
+                // Leave in Triage — don't add 'triaged' label so it gets re-checked
+                continue;
+              }
+
+              // === LOW CONFIDENCE ===
+              if (triage.confidence === 'low') {
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum,
+                  body: `🔍 **Needs human triage** — AI confidence is low.\n\n**Reasoning:** ${triage.reasoning}\n\n**Best guess:**\n${triage.repos.map(r => `- \`${r.repo}\`: ${r.title} (${r.assignee})`).join('\n')}\n\nPlease review and confirm, or triage manually.`
+                });
+                await notifySlack(`🔍 *Low confidence triage*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}`);
+                console.log(`  Low confidence — flagged for human review`);
+                continue;
+              }
+
+              // === CREATE SUB-ISSUES ===
+              const subIssueLinks = [];
+              const priorityLabel = `priority:${priority.toLowerCase()}`;
+
+              if (triage.isSingleTask) {
+                // Single-task item: keep in bd4-intake with tracking label, assign directly
+                const assignee = triage.repos[0]?.assignee;
+                if (assignee) {
+                  await github.rest.issues.addAssignees({
+                    owner, repo: repoName, issue_number: issueNum, assignees: [assignee]
+                  });
+                }
+                await github.rest.issues.addLabels({
+                  owner, repo: repoName, issue_number: issueNum,
+                  labels: ['triaged', 'tracking']
+                });
+                subIssueLinks.push(`Single-task item — assigned to @${assignee}, no sub-issues needed.`);
+              } else {
+                // Multi-task: create sub-issues in target repos
+                for (const sub of triage.repos) {
+                  const created = await createCrossRepoIssue(
+                    sub.repo,
+                    sub.title,
+                    `Parent: TractionBD/bd4-intake#${issueNum}\n\n${sub.description}\n\n---\n*Auto-triaged from [bd4-intake#${issueNum}](https://github.com/${repoFull}/issues/${issueNum})*`,
+                    ['bug', priorityLabel],
+                    sub.assignee ? [sub.assignee] : []
+                  );
+                  subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title} (@${sub.assignee})`);
+
+                  // Add sub-issue to project with Ready status
+                  try {
+                    await addToProjectWithStatus(created.node_id, 'Ready', priority);
+                  } catch (e) {
+                    console.log(`  Warning: couldn't add ${sub.repo}#${created.number} to project: ${e.message}`);
+                  }
+                }
+
+                // Update intake issue: add tracking label, triaged label
+                await github.rest.issues.addLabels({
+                  owner, repo: repoName, issue_number: issueNum,
+                  labels: ['triaged', 'tracking']
+                });
+              }
+
+              // Post triage comment
+              const provider = process.env.LLM_PROVIDER || 'openai';
+              const triageComment = triage.isSingleTask
+                ? `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n${subIssueLinks[0]}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`
+                : `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
+
+              await github.rest.issues.createComment({
+                owner, repo: repoName, issue_number: issueNum, body: triageComment
+              });
+
+              // Move to Ready
+              await setStatus(item.id, 'Ready');
+              console.log(`  Triaged → Ready (${triage.repos.length} repo(s), confidence: ${triage.confidence})`);
+
+              // Notify Slack
+              await notifySlack(`✅ *Issue auto-triaged*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Sub-issues:* ${triage.repos.map(r => `\`${r.repo}\`: ${r.title}`).join(', ')}`);
+            }
+
+            console.log('\nEnhanced triage complete.');

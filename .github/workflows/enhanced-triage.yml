@@ -1,13 +1,16 @@
 name: Enhanced Triage
 
 on:
-  # Real-time: fires when a project card is edited (e.g., moved to Triage)
-  projects_v2_item:
-    types: [edited]
-  # Fallback: catch anything missed
+  # Scheduled: check for items in Triage every 15 minutes
+  # Real-time trigger via projects_v2_item is in TractionBD/.github repo
+  # (projects_v2_item events only work at org level)
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch: {}
+  # Also trigger when tracking-sync runs (it may move items to Triage)
+  workflow_run:
+    workflows: ["Tracking Issue Status Sync"]
+    types: [completed]
 
 permissions:
   issues: write
@@ -20,12 +23,7 @@ concurrency:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    # Only run for BD4 project events, or on schedule/manual
-    if: |
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'projects_v2_item' &&
-       github.event.projects_v2_item.project_node_id == 'PVT_kwDODvlY_84BRmQU')
+    # Runs on schedule, manual dispatch, or after tracking-sync completes
 
     steps:
       - name: Triage items in Triage status

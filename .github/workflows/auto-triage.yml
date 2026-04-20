@@ -31,8 +31,30 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_BUGTRIAGE }}
           CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # CROSS_REPO_TOKEN is a PAT with repo + project scope; needed for
+          # cross-repo issue creation AND for adding items to the BD4 project v2.
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
           script: |
+            // --- BD4 Project v2 metadata ---
+            const PROJECT_ID = 'PVT_kwDODvlY_84BRmQU';
+            const STATUS_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YSso';
+            const PRIORITY_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YTuA';
+            const STATUS_OPTIONS = {
+              'Backlog':     'a9b5279c',
+              'Design':      '920a29e4',
+              'Triage':      'f0a0aebb',
+              'Ready':       '45de947b',
+              'In Progress': 'ec09aae4',
+              'In Review':   '546b9235',
+              'Done':        'df73bb56'
+            };
+            const PRIORITY_OPTIONS = {
+              'priority:urgent': 'ee8aa970',
+              'priority:high':   'e5ba6df9',
+              'priority:medium': '3f9bcc8d',
+              'priority:low':    'a59d52d9'
+            };
+
             // Helper: create issue in another repo using PAT
             async function createCrossRepoIssue(repo, title, body, labels) {
               const res = await fetch(`https://api.github.com/repos/TractionBD/${repo}/issues`, {
@@ -49,6 +71,68 @@ jobs:
                 throw new Error(`Failed to create issue in ${repo}: ${res.status} ${err}`);
               }
               return res.json();
+            }
+
+            // Helper: add an issue (by node_id) to the BD4 project and set
+            // Status + Priority. Safe to call even if already on board
+            // (addProjectV2ItemById is idempotent — returns existing item).
+            async function addToProjectAndSetFields(contentNodeId, statusName, priorityLabel) {
+              try {
+                const addRes = await github.graphql(`
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                      item { id }
+                    }
+                  }
+                `, { projectId: PROJECT_ID, contentId: contentNodeId });
+                const itemId = addRes.addProjectV2ItemById.item.id;
+
+                const statusOptionId = STATUS_OPTIONS[statusName];
+                if (statusOptionId) {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                      updateProjectV2ItemFieldValue(input: {
+                        projectId: $projectId, itemId: $itemId,
+                        fieldId: $fieldId, value: { singleSelectOptionId: $optionId }
+                      }) { projectV2Item { id } }
+                    }
+                  `, {
+                    projectId: PROJECT_ID, itemId, fieldId: STATUS_FIELD_ID,
+                    optionId: statusOptionId
+                  });
+                }
+
+                const priorityOptionId = PRIORITY_OPTIONS[priorityLabel];
+                if (priorityOptionId) {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                      updateProjectV2ItemFieldValue(input: {
+                        projectId: $projectId, itemId: $itemId,
+                        fieldId: $fieldId, value: { singleSelectOptionId: $optionId }
+                      }) { projectV2Item { id } }
+                    }
+                  `, {
+                    projectId: PROJECT_ID, itemId, fieldId: PRIORITY_FIELD_ID,
+                    optionId: priorityOptionId
+                  });
+                }
+                return itemId;
+              } catch (e) {
+                console.log(`addToProjectAndSetFields failed: ${e.message}`);
+                return null;
+              }
+            }
+
+            // Helper: close an issue with a reason via GraphQL
+            // (gh REST close does not accept state_reason on all paths).
+            async function closeIssueAsNotPlanned(issueNodeId) {
+              await github.graphql(`
+                mutation($id: ID!) {
+                  closeIssue(input: {issueId: $id, stateReason: NOT_PLANNED}) {
+                    issue { number state }
+                  }
+                }
+              `, { id: issueNodeId });
             }
 
             const issue = context.payload.issue;
@@ -191,29 +275,17 @@ jobs:
               return;
             }
 
-            // Create sub-issues in target repos using PAT for cross-repo access
-            const subIssueLinks = [];
-            for (const sub of triage.repos) {
-              const created = await createCrossRepoIssue(
-                sub.repo,
-                sub.title,
-                `Parent: TractionBD/bd4-intake#${issue.number}\n\n**Reason:** ${sub.reason}\n\n---\n*Original bug report:*\n\n> ${title}\n\n${body}`,
-                ['bug', priorityLabel]
-              );
-              subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title}`);
-            }
+            // ─────────────────────────────────────────────────────────────
+            // Branch on single-repo vs multi-repo.
+            //
+            // Single-repo rule (CLAUDE.md): create the issue directly in the
+            // target repo with the `tracking` label, and CLOSE the intake
+            // issue — do NOT leave a one-sub-issue wrapper parent hanging
+            // around. Multi-repo keeps the original wrapper+sub-issues flow.
+            // ─────────────────────────────────────────────────────────────
+            const isSingleRepo = triage.repos.length === 1;
 
-            // Update intake issue with sub-issue links
-            const triageComment = `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: triageComment
-            });
-
-            // Remove needs-triage label, add triaged
+            // Remove needs-triage label early (applies to both paths)
             await github.rest.issues.removeLabel({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -221,23 +293,115 @@ jobs:
               name: 'needs-triage'
             }).catch(() => {});
 
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              labels: ['triaged', 'tracking']
-            });
+            if (isSingleRepo) {
+              const target = triage.repos[0];
 
-            // Notify Slack for all triaged bugs
-            if (process.env.SLACK_WEBHOOK_URL) {
-              const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-              const submitter = issue.user?.login || 'unknown';
-              const subIssueSummary = subIssueLinks.map(l => `• ${l.replace('- [ ] ', '')}`).join('\n');
-              await fetch(process.env.SLACK_WEBHOOK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  text: `🐛 *Bug auto-triaged*\n*Issue:* <${issue.html_url}|bd4-intake#${issue.number}> — ${title}\n*Submitted by:* ${submitter}\n*Time:* ${timestamp}\n*Severity:* ${severity}\n*Sub-issues created:*\n${subIssueSummary}`
-                })
+              // Body: no "Parent:" pointer — this IS the canonical issue.
+              // Preserve the original bug report content verbatim.
+              const createdBody = `${body}\n\n---\n*Auto-triaged from bd4-intake#${issue.number} (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'}) — reason: ${sanitize(target.reason)}*`;
+
+              const created = await createCrossRepoIssue(
+                target.repo,
+                target.title,
+                createdBody,
+                ['bug', priorityLabel, 'tracking']
+              );
+
+              // Put the canonical issue on the BD4 board at Status=Triage so
+              // a human can promote it to Ready / Design / Backlog. Priority
+              // field is set from the priority label so it shows immediately.
+              await addToProjectAndSetFields(created.node_id, 'Triage', priorityLabel);
+
+              // Comment on intake explaining the consolidation, then close.
+              const intakeComment = `✅ **Auto-triaged** (confidence: ${triage.confidence}) — single-repo bug.\n\n**Reasoning:** ${triage.reasoning}\n\n**Canonical issue:** TractionBD/${target.repo}#${created.number} — ${target.title}\n\nThis intake issue is being closed as a duplicate; all further work and discussion should happen on the canonical issue linked above.\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: intakeComment
               });
+
+              // Add `triaged` so reporting queries still see this was processed.
+              // Do NOT add `tracking` — the canonical issue in the target repo
+              // owns that role now.
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['triaged']
+              });
+
+              // Close as not-planned (it's a dup of the canonical issue).
+              await closeIssueAsNotPlanned(issue.node_id);
+
+              if (process.env.SLACK_WEBHOOK_URL) {
+                const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+                const submitter = issue.user?.login || 'unknown';
+                await fetch(process.env.SLACK_WEBHOOK_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    text: `🐛 *Bug auto-triaged (single-repo)*\n*Canonical:* <https://github.com/TractionBD/${target.repo}/issues/${created.number}|${target.repo}#${created.number}> — ${target.title}\n*Intake (closed):* <${issue.html_url}|bd4-intake#${issue.number}>\n*Submitted by:* ${submitter}\n*Time:* ${timestamp}\n*Severity:* ${severity}`
+                  })
+                });
+              }
+            } else {
+              // Multi-repo path: keep the intake issue as the parent tracker
+              // and open sub-issues in each target repo.
+              const subIssueLinks = [];
+              const subIssueNodeIds = [];
+              for (const sub of triage.repos) {
+                const created = await createCrossRepoIssue(
+                  sub.repo,
+                  sub.title,
+                  `Parent: TractionBD/bd4-intake#${issue.number}\n\n**Reason:** ${sub.reason}\n\n---\n*Original bug report:*\n\n> ${title}\n\n${body}`,
+                  ['bug', priorityLabel]
+                );
+                subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title}`);
+                subIssueNodeIds.push(created.node_id);
+
+                // Each sub-issue lands on the BD4 board at Triage so humans
+                // can route it without it falling off the board entirely.
+                await addToProjectAndSetFields(created.node_id, 'Triage', priorityLabel);
+              }
+
+              const triageComment = `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: triageComment
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['triaged', 'tracking']
+              });
+
+              // Also place the parent tracking issue on the BD4 board at
+              // Triage so status is visible (this addresses the historical
+              // gap where tracking parents had labels but no board Status).
+              await addToProjectAndSetFields(issue.node_id, 'Triage', priorityLabel);
+
+              if (process.env.SLACK_WEBHOOK_URL) {
+                const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+                const submitter = issue.user?.login || 'unknown';
+                const subIssueSummary = subIssueLinks.map(l => `• ${l.replace('- [ ] ', '')}`).join('\n');
+                await fetch(process.env.SLACK_WEBHOOK_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    text: `🐛 *Bug auto-triaged*\n*Issue:* <${issue.html_url}|bd4-intake#${issue.number}> — ${title}\n*Submitted by:* ${submitter}\n*Time:* ${timestamp}\n*Severity:* ${severity}\n*Sub-issues created:*\n${subIssueSummary}`
+                  })
+                });
+              }
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            function sanitize(s) {
+              return (s || '').replace(/[\r\n]+/g, ' ').slice(0, 500);
             }

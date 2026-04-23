@@ -107,37 +107,62 @@ def _psycopg2():
     return psycopg2
 
 
-def _pg_sql():
-    from psycopg2 import sql  # noqa: PLC0415
-    return sql
-
-
 # ── Wipe logic ────────────────────────────────────────────────────────────────
 
-_PROFILE_TREE_TABLES = [
-    "voice_profiles",
-    "personal_profiles",
-    "career_profiles",
+# (table_label, count_sql, delete_sql) — fully static; col varies by group
+_PROFILE_TREE_OPS = [
+    (
+        "voice_profiles",
+        "SELECT COUNT(*) FROM voice_profiles WHERE user_profile_id = %s",
+        "DELETE FROM voice_profiles WHERE user_profile_id = %s",
+    ),
+    (
+        "personal_profiles",
+        "SELECT COUNT(*) FROM personal_profiles WHERE user_profile_id = %s",
+        "DELETE FROM personal_profiles WHERE user_profile_id = %s",
+    ),
+    (
+        "career_profiles",
+        "SELECT COUNT(*) FROM career_profiles WHERE user_profile_id = %s",
+        "DELETE FROM career_profiles WHERE user_profile_id = %s",
+    ),
 ]
 
-_USER_SCOPED_TABLES = [
-    "target_profiles",
-    "contacts",
-    "action_preferences",
-    "integration_accounts",
-    "email_metadata",
+_USER_SCOPED_OPS = [
+    (
+        "target_profiles",
+        "SELECT COUNT(*) FROM target_profiles WHERE user_id = %s",
+        "DELETE FROM target_profiles WHERE user_id = %s",
+    ),
+    (
+        "contacts",
+        "SELECT COUNT(*) FROM contacts WHERE user_id = %s",
+        "DELETE FROM contacts WHERE user_id = %s",
+    ),
+    (
+        "action_preferences",
+        "SELECT COUNT(*) FROM action_preferences WHERE user_id = %s",
+        "DELETE FROM action_preferences WHERE user_id = %s",
+    ),
+    (
+        "integration_accounts",
+        "SELECT COUNT(*) FROM integration_accounts WHERE user_id = %s",
+        "DELETE FROM integration_accounts WHERE user_id = %s",
+    ),
+    (
+        "email_metadata",
+        "SELECT COUNT(*) FROM email_metadata WHERE user_id = %s",
+        "DELETE FROM email_metadata WHERE user_id = %s",
+    ),
 ]
 
 
-def _count(cur, table: str, col: str, val: str) -> int:
-    psql = _pg_sql()
-    cur.execute(
-        psql.SQL("SELECT COUNT(*) FROM {} WHERE {} = %s").format(
-            psql.Identifier(table), psql.Identifier(col)
-        ),
-        (val,),
-    )
-    return cur.fetchone()[0]
+def _delete_report(cur, label: str, count_sql: str, delete_sql: str, val: str) -> None:
+    cur.execute(count_sql, (val,))
+    before = cur.fetchone()[0]
+    cur.execute(delete_sql, (val,))
+    deleted = cur.rowcount
+    print(f"  {label:<28} {before:>6}  {deleted:>7}  {before - deleted:>6}")
 
 
 def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
@@ -191,34 +216,22 @@ def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
         print(f"  {'Table':<28} {'Before':>6}  {'Deleted':>7}  {'After':>6}")
         print(f"  {'-'*28} {'-'*6}  {'-'*7}  {'-'*6}")
 
-        psql = _pg_sql()
-
         if user_profile_id:
-            for tbl in _PROFILE_TREE_TABLES:
-                before = _count(cur, tbl, "user_profile_id", user_profile_id)
-                cur.execute(
-                    psql.SQL("DELETE FROM {} WHERE user_profile_id = %s").format(psql.Identifier(tbl)),
-                    (user_profile_id,),
-                )
-                deleted = cur.rowcount
-                print(f"  {tbl:<28} {before:>6}  {deleted:>7}  {before - deleted:>6}")
+            for label, count_sql, delete_sql in _PROFILE_TREE_OPS:
+                _delete_report(cur, label, count_sql, delete_sql, user_profile_id)
 
-            before = _count(cur, "user_profiles", "id", user_profile_id)
+            cur.execute("SELECT COUNT(*) FROM user_profiles WHERE id = %s", (user_profile_id,))
+            before = cur.fetchone()[0]
             cur.execute("DELETE FROM user_profiles WHERE id = %s", (user_profile_id,))
             deleted = cur.rowcount
             print(f"  {'user_profiles':<28} {before:>6}  {deleted:>7}  {before - deleted:>6}")
         else:
-            for tbl in _PROFILE_TREE_TABLES + ["user_profiles"]:
-                print(f"  {tbl:<28} {'0':>6}  {'0':>7}  {'0':>6}")
+            for label, _, __ in _PROFILE_TREE_OPS:
+                print(f"  {label:<28} {'0':>6}  {'0':>7}  {'0':>6}")
+            print(f"  {'user_profiles':<28} {'0':>6}  {'0':>7}  {'0':>6}")
 
-        for tbl in _USER_SCOPED_TABLES:
-            before = _count(cur, tbl, "user_id", user_id)
-            cur.execute(
-                psql.SQL("DELETE FROM {} WHERE user_id = %s").format(psql.Identifier(tbl)),
-                (user_id,),
-            )
-            deleted = cur.rowcount
-            print(f"  {tbl:<28} {before:>6}  {deleted:>7}  {before - deleted:>6}")
+        for label, count_sql, delete_sql in _USER_SCOPED_OPS:
+            _delete_report(cur, label, count_sql, delete_sql, user_id)
 
         # 5. Reset flags
         cur.execute(

@@ -27,11 +27,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout tbd-backend
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          repository: TractionBD/tbd-backend
-          token: ${{ secrets.CROSS_REPO_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

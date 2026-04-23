@@ -130,10 +130,10 @@ _USER_SCOPED_TABLES = [
 
 
 def _count(cur, table: str, col: str, val: str) -> int:
-    sql = _pg_sql()
+    psql = _pg_sql()
     cur.execute(
-        sql.SQL("SELECT COUNT(*) FROM {} WHERE {} = %s").format(
-            sql.Identifier(table), sql.Identifier(col)
+        psql.SQL("SELECT COUNT(*) FROM {} WHERE {} = %s").format(
+            psql.Identifier(table), psql.Identifier(col)
         ),
         (val,),
     )
@@ -191,13 +191,13 @@ def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
         print(f"  {'Table':<28} {'Before':>6}  {'Deleted':>7}  {'After':>6}")
         print(f"  {'-'*28} {'-'*6}  {'-'*7}  {'-'*6}")
 
-        sql = _pg_sql()
+        psql = _pg_sql()
 
         if user_profile_id:
             for tbl in _PROFILE_TREE_TABLES:
                 before = _count(cur, tbl, "user_profile_id", user_profile_id)
                 cur.execute(
-                    sql.SQL("DELETE FROM {} WHERE user_profile_id = %s").format(sql.Identifier(tbl)),
+                    psql.SQL("DELETE FROM {} WHERE user_profile_id = %s").format(psql.Identifier(tbl)),
                     (user_profile_id,),
                 )
                 deleted = cur.rowcount
@@ -214,7 +214,7 @@ def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
         for tbl in _USER_SCOPED_TABLES:
             before = _count(cur, tbl, "user_id", user_id)
             cur.execute(
-                sql.SQL("DELETE FROM {} WHERE user_id = %s").format(sql.Identifier(tbl)),
+                psql.SQL("DELETE FROM {} WHERE user_id = %s").format(psql.Identifier(tbl)),
                 (user_id,),
             )
             deleted = cur.rowcount

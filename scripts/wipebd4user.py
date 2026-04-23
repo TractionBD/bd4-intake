@@ -19,8 +19,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import date, datetime
-from uuid import UUID
 
 # ── Railway / env config ──────────────────────────────────────────────────────
 
@@ -39,18 +37,7 @@ ENV_ALIASES = {
     "production": "prod",
 }
 
-PSYCOPG2_PATH = None  # psycopg2-binary installed in active venv
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-class _Enc(json.JSONEncoder):
-    def default(self, o):
-        if isinstance(o, (datetime, date)):
-            return o.isoformat()
-        if isinstance(o, UUID):
-            return str(o)
-        return super().default(o)
 
 
 def _get_railway_token() -> str:
@@ -120,6 +107,11 @@ def _psycopg2():
     return psycopg2
 
 
+def _pg_sql():
+    from psycopg2 import sql  # noqa: PLC0415
+    return sql
+
+
 # ── Wipe logic ────────────────────────────────────────────────────────────────
 
 _PROFILE_TREE_TABLES = [
@@ -138,7 +130,13 @@ _USER_SCOPED_TABLES = [
 
 
 def _count(cur, table: str, col: str, val: str) -> int:
-    cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} = %s", (val,))  # noqa: S608
+    sql = _pg_sql()
+    cur.execute(
+        sql.SQL("SELECT COUNT(*) FROM {} WHERE {} = %s").format(
+            sql.Identifier(table), sql.Identifier(col)
+        ),
+        (val,),
+    )
     return cur.fetchone()[0]
 
 
@@ -193,11 +191,13 @@ def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
         print(f"  {'Table':<28} {'Before':>6}  {'Deleted':>7}  {'After':>6}")
         print(f"  {'-'*28} {'-'*6}  {'-'*7}  {'-'*6}")
 
+        sql = _pg_sql()
+
         if user_profile_id:
             for tbl in _PROFILE_TREE_TABLES:
                 before = _count(cur, tbl, "user_profile_id", user_profile_id)
                 cur.execute(
-                    f"DELETE FROM {tbl} WHERE user_profile_id = %s",  # noqa: S608
+                    sql.SQL("DELETE FROM {} WHERE user_profile_id = %s").format(sql.Identifier(tbl)),
                     (user_profile_id,),
                 )
                 deleted = cur.rowcount
@@ -214,7 +214,7 @@ def wipe_user(env_name: str, emails: list[str], db_url: str) -> None:
         for tbl in _USER_SCOPED_TABLES:
             before = _count(cur, tbl, "user_id", user_id)
             cur.execute(
-                f"DELETE FROM {tbl} WHERE user_id = %s",  # noqa: S608
+                sql.SQL("DELETE FROM {} WHERE user_id = %s").format(sql.Identifier(tbl)),
                 (user_id,),
             )
             deleted = cur.rowcount

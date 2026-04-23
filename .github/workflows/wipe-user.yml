@@ -1,0 +1,54 @@
+name: Wipe BD4 User
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to wipe"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      email:
+        description: "User email to wipe (primary)"
+        required: true
+        type: string
+      email_fallback:
+        description: "Fallback email if primary not found (optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  wipe:
+    name: "Wipe ${{ inputs.email }} from ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tbd-backend
+        uses: actions/checkout@v4
+        with:
+          repository: TractionBD/tbd-backend
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Run wipe
+        env:
+          BD4_DB_URL_DEV: ${{ secrets.DATABASE_URL_DIRECT }}
+          BD4_DB_URL_STAGING: ${{ secrets.DATABASE_URL_DIRECT_STAGING }}
+          BD4_DB_URL_PROD: ${{ secrets.DATABASE_URL_DIRECT_PROD }}
+        run: |
+          EMAILS="${{ inputs.email }}"
+          if [ -n "${{ inputs.email_fallback }}" ]; then
+            EMAILS="$EMAILS ${{ inputs.email_fallback }}"
+          fi
+          python scripts/wipebd4user.py "${{ inputs.environment }}" $EMAILS

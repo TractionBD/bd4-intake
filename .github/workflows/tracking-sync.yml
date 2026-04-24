@@ -65,22 +65,6 @@ jobs:
                             state
                             repository { name nameWithOwner }
                             labels(first: 10) { nodes { name } }
-                            subIssues(first: 20) {
-                              nodes {
-                                id
-                                number
-                                title
-                                state
-                                repository { name nameWithOwner }
-                              }
-                            }
-                            trackedInIssues(first: 5) {
-                              nodes {
-                                id
-                                number
-                                repository { name nameWithOwner }
-                              }
-                            }
                           }
                         }
                       }
@@ -134,35 +118,51 @@ jobs:
             const allItems = await getProjectItems();
             console.log(`Found ${allItems.length} project items`);
 
-            // Find tracking issues (in bd4-intake with 'tracking' label and sub-issues)
+            // Find tracking issues (in bd4-intake with 'tracking' label)
             const trackingItems = allItems.filter(item => {
               const content = item.content;
               if (!content) return false;
               const isIntake = content.repository?.name === 'bd4-intake';
               const hasTracking = content.labels?.nodes?.some(l => l.name === 'tracking');
-              const hasSubs = content.subIssues?.nodes?.length > 0;
-              return isIntake && hasTracking && hasSubs;
+              return isIntake && hasTracking;
             });
 
-            console.log(`Found ${trackingItems.length} tracking issues with sub-issues`);
+            console.log(`Found ${trackingItems.length} tracking issues`);
 
             for (const tracking of trackingItems) {
               const trackingStatus = tracking.status?.name;
-              const subIssues = tracking.content.subIssues.nodes;
               const trackingNum = tracking.content.number;
 
-              console.log(`\n#${trackingNum} "${tracking.content.title}" [${trackingStatus}] — ${subIssues.length} sub-issues`);
+              console.log(`\n#${trackingNum} "${tracking.content.title}" [${trackingStatus}]`);
 
-              // Get sub-issue statuses from project
-              const subStatuses = [];
-              for (const sub of subIssues) {
-                const subItem = findProjectItem(allItems, sub.id);
-                const subStatus = subItem?.status?.name || (sub.state === 'CLOSED' ? 'Done' : 'Backlog');
-                subStatuses.push({ ...sub, projectItem: subItem, status: subStatus });
-                console.log(`  Sub #${sub.number} (${sub.repository.name}) [${subStatus}]`);
+              // Find sub-issues via search (subIssues GraphQL field requires GitHub App token)
+              let searchItems = [];
+              try {
+                const searchRes = await github.rest.search.issuesAndPullRequests({
+                  q: `org:TractionBD "bd4-intake#${trackingNum}" in:body is:issue -repo:TractionBD/bd4-intake`,
+                  per_page: 20
+                });
+                searchItems = searchRes.data.items;
+              } catch (e) {
+                console.log(`  Search failed: ${e.message}`);
+                continue;
               }
 
-              // RULE 1: When tracking is Ready, promote sub-issues from Backlog/Design to Ready
+              if (searchItems.length === 0) {
+                console.log(`  No sub-issues found via search`);
+                continue;
+              }
+
+              const subStatuses = [];
+              for (const sub of searchItems) {
+                const repoName = sub.repository_url.split('/').pop();
+                const subItem = allItems.find(i => i.content?.id === sub.node_id);
+                const subStatus = subItem?.status?.name || (sub.state === 'closed' ? 'Done' : 'Backlog');
+                subStatuses.push({ ...sub, repoName, projectItem: subItem, status: subStatus });
+                console.log(`  Sub #${sub.number} (${repoName}) [${subStatus}]`);
+              }
+
+              // RULE 1: When tracking is Ready, promote sub-issues from Backlog/Design/Triage to Ready
               if (trackingStatus === 'Ready') {
                 for (const sub of subStatuses) {
                   if (sub.projectItem && PROMOTABLE_TO_READY.has(sub.status)) {
@@ -172,8 +172,7 @@ jobs:
                 }
               }
 
-              // RULE 2: If any sub-issue is In Progress (or beyond), move tracking to In Progress
-              // Only if tracking is currently behind In Progress
+              // RULE 2: If any sub-issue is In Progress or beyond, move tracking to In Progress
               const anyInProgressOrBeyond = subStatuses.some(s =>
                 STATUS_ORDER[s.status] >= STATUS_ORDER['In Progress'] && s.status !== 'Done'
               );
@@ -187,7 +186,6 @@ jobs:
               if (allDone && trackingStatus !== 'Done') {
                 console.log(`  Moving tracking #${trackingNum} → Done (all sub-issues complete)`);
                 await setProjectItemStatus(tracking.id, 'Done');
-                // Also close the GitHub issue
                 await github.rest.issues.update({
                   owner: 'TractionBD',
                   repo: 'bd4-intake',

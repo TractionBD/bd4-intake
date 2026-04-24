@@ -97,7 +97,6 @@ jobs:
                             id number title body state
                             repository { name nameWithOwner }
                             labels(first: 10) { nodes { name } }
-                            subIssues(first: 20) { nodes { id number } }
                           }
                         }
                       }
@@ -236,8 +235,6 @@ jobs:
               const content = item.content;
               if (!content || !content.title) return false;
               if (item.status?.name !== 'Triage') return false;
-              // Skip if already triaged (has sub-issues)
-              if (content.subIssues?.nodes?.length > 0) return false;
               // Skip if already has 'triaged' label
               if (content.labels?.nodes?.some(l => l.name === 'triaged')) return false;
               return true;

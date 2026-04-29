@@ -692,8 +692,11 @@ jobs:
             }
 
             // === RUN SUMMARY ===
-            const total = Object.values(summary).reduce((a, b) => a + b, 0);
-            if (total > 0) {
+            // Only post the summary when something was actually triaged or errored.
+            // Routine no-ops (kicked-to-design, duplicate-skips, already-fixed flags)
+            // are visible in the per-item Slack pings + workflow logs; no need to
+            // also page the channel with a "ran but nothing notable" message.
+            if (summary.triaged > 0 || summary.errored > 0) {
               await notifySlack(
                 `🤖 *Enhanced Triage run complete*\n` +
                 `Triaged: ${summary.triaged} · ` +

@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   triage:
+    # NOTE: This workflow is currently DISABLED in the GitHub Actions UI.
+    # The improvements here are staged for when it is re-enabled.
     runs-on: ubuntu-latest
     # Runs on schedule, manual dispatch, or after tracking-sync completes
 
@@ -56,6 +58,7 @@ jobs:
               'Low':    'a59d52d9'
             };
             const MAX_RETRIES = 3;
+            const STOPWORDS = new Set(['a','an','the','is','on','in','to','for','of','with','and','or','but']);
 
             // Helper: create issue in another repo using PAT
             async function createCrossRepoIssue(repo, title, body, labels, assignees = []) {
@@ -129,28 +132,65 @@ jobs:
               `, { projectId: PROJECT_ID, itemId: itemId, fieldId: STATUS_FIELD_ID, optionId });
             }
 
-            // Helper: add issue to project and set status
-            async function addToProjectWithStatus(nodeId, statusName, priorityName) {
-              const result = await github.graphql(`
-                mutation($projectId: ID!, $contentId: ID!) {
-                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-                    item { id }
+            // Helper: add issue to project AND set Status + Priority in one shot.
+            // priorityLabel may be either a priority NAME ('High') or label
+            // form ('priority:high'); both are accepted.
+            async function addToProjectAndSetFields(contentNodeId, statusName, priorityLabel) {
+              try {
+                const addRes = await github.graphql(`
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                      item { id }
+                    }
+                  }
+                `, { projectId: PROJECT_ID, contentId: contentNodeId });
+                const itemId = addRes.addProjectV2ItemById.item.id;
+
+                const statusOptionId = STATUS_OPTIONS[statusName];
+                if (statusOptionId) {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                      updateProjectV2ItemFieldValue(input: {
+                        projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                        value: { singleSelectOptionId: $optionId }
+                      }) { projectV2Item { id } }
+                    }
+                  `, { projectId: PROJECT_ID, itemId, fieldId: STATUS_FIELD_ID, optionId: statusOptionId });
+                }
+
+                // Normalize priority: accept 'High' or 'priority:high'
+                let priorityName = priorityLabel || '';
+                if (priorityName.startsWith('priority:')) {
+                  const bare = priorityName.slice('priority:'.length);
+                  priorityName = bare.charAt(0).toUpperCase() + bare.slice(1).toLowerCase();
+                }
+                const priorityOptionId = PRIORITY_OPTIONS[priorityName];
+                if (priorityOptionId) {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                      updateProjectV2ItemFieldValue(input: {
+                        projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                        value: { singleSelectOptionId: $optionId }
+                      }) { projectV2Item { id } }
+                    }
+                  `, { projectId: PROJECT_ID, itemId, fieldId: PRIORITY_FIELD_ID, optionId: priorityOptionId });
+                }
+                return itemId;
+              } catch (e) {
+                console.log(`addToProjectAndSetFields failed: ${e.message}`);
+                return null;
+              }
+            }
+
+            // Helper: close an issue with NOT_PLANNED reason via GraphQL
+            async function closeIssueAsNotPlanned(issueNodeId) {
+              await github.graphql(`
+                mutation($id: ID!) {
+                  closeIssue(input: { issueId: $id, stateReason: NOT_PLANNED }) {
+                    issue { number state }
                   }
                 }
-              `, { projectId: PROJECT_ID, contentId: nodeId });
-              const itemId = result.addProjectV2ItemById.item.id;
-              await setStatus(itemId, statusName);
-              if (priorityName && PRIORITY_OPTIONS[priorityName]) {
-                await github.graphql(`
-                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                    updateProjectV2ItemFieldValue(input: {
-                      projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
-                      value: { singleSelectOptionId: $optionId }
-                    }) { projectV2Item { id } }
-                  }
-                `, { projectId: PROJECT_ID, itemId: itemId, fieldId: PRIORITY_FIELD_ID, optionId: PRIORITY_OPTIONS[priorityName] });
-              }
-              return itemId;
+              `, { id: issueNodeId });
             }
 
             // Helper: get frontend dev with fewest active issues
@@ -223,6 +263,64 @@ jobs:
               });
             }
 
+            // Helper: tokenize a title for word-overlap heuristic
+            function significantTokens(title) {
+              return new Set(
+                (title || '')
+                  .toLowerCase()
+                  .replace(/[^\w\s]/g, ' ')
+                  .split(/\s+/)
+                  .filter(w => w.length > 2 && !STOPWORDS.has(w))
+              );
+            }
+
+            // Helper: parse "bd4-intake#NNN" issue numbers from a CodeRabbit
+            // "Possible Duplicate Issue(s)" comment. Returns array of numbers.
+            function parseCodeRabbitDupes(commentBody) {
+              if (!commentBody) return [];
+              const nums = [];
+              const re = /bd4-intake#(\d+)/gi;
+              let m;
+              while ((m = re.exec(commentBody)) !== null) {
+                nums.push(parseInt(m[1], 10));
+              }
+              return [...new Set(nums)];
+            }
+
+            // Helper: search for already-merged PRs across the three code repos
+            // whose title overlaps the intake title by >=3 significant words.
+            async function findRecentMergedPRMatch(intakeTitle) {
+              const intakeTokens = significantTokens(intakeTitle);
+              if (intakeTokens.size < 3) return null;
+              const sinceDate = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000)
+                .toISOString().slice(0, 10);
+              const repos = ['tbd-frontend', 'tbd-bff', 'tbd-backend'];
+              for (const repo of repos) {
+                try {
+                  const q = `repo:TractionBD/${repo} is:pr is:merged merged:>=${sinceDate}`;
+                  const res = await github.rest.search.issuesAndPullRequests({
+                    q, per_page: 50
+                  });
+                  for (const pr of res.data.items || []) {
+                    const prTokens = significantTokens(pr.title);
+                    let shared = 0;
+                    for (const t of intakeTokens) if (prTokens.has(t)) shared++;
+                    if (shared >= 3) {
+                      return {
+                        repo,
+                        number: pr.number,
+                        title: pr.title,
+                        merged_at: pr.closed_at || pr.updated_at
+                      };
+                    }
+                  }
+                } catch (e) {
+                  console.log(`PR search in ${repo} failed: ${e.message}`);
+                }
+              }
+              return null;
+            }
+
             // ============================================================
             // MAIN LOGIC
             // ============================================================
@@ -237,10 +335,22 @@ jobs:
               if (item.status?.name !== 'Triage') return false;
               // Skip if already has 'triaged' label
               if (content.labels?.nodes?.some(l => l.name === 'triaged')) return false;
+              // Skip if intake issue is already closed
+              if (content.state && content.state !== 'OPEN') return false;
               return true;
             });
 
             console.log(`Found ${triageItems.length} items needing triage`);
+
+            const summary = {
+              triaged: 0,
+              skipped_duplicate: 0,
+              skipped_already_fixed: 0,
+              kicked_to_design: 0,
+              low_confidence: 0,
+              readiness_failed: 0,
+              errored: 0
+            };
 
             if (triageItems.length === 0) {
               console.log('Nothing to triage. Exiting.');
@@ -256,9 +366,17 @@ jobs:
             - tbd-bff: Next.js BFF. Middleware between mobile app and backend API.
             - tbd-backend: FastAPI Python backend. Business logic, database, Celery tasks, enrichment, external APIs.
 
+            NOTE: tbd-design is a docs/Figma reference repo. NEVER include it in repos. Design specs live there but no work tickets.
+
             ## Assignment Rules
             - tbd-backend or tbd-bff work → assign to "kul-pointe"
             - tbd-frontend work → assign to the frontend dev specified in the prompt
+
+            ## Single repo is the common case
+            Most bugs and small features are SINGLE-REPO. Only return multiple repos when the work
+            genuinely cannot be done in one repo (e.g., requires both a backend API change AND a
+            frontend UI change that depends on it). Default to one repo unless there is a clear
+            cross-repo dependency.
 
             ## Your evaluation must cover:
 
@@ -275,9 +393,8 @@ jobs:
             3. **Dependency check**: Does this depend on other work that isn't done?
                - References to other issues that might need to be completed first?
 
-            4. **Repo analysis**: Which repo(s) need sub-issues?
-               - Create ONE sub-issue per repo (not per task within a repo)
-               - Each sub-issue should describe ALL the work needed in that repo
+            4. **Repo analysis**: Which repo(s) need work?
+               - Prefer ONE repo. Each repo entry should describe ALL the work needed in that repo.
 
             Respond in JSON:
             {
@@ -291,14 +408,13 @@ jobs:
               "repos": [
                 {
                   "repo": "tbd-frontend|tbd-bff|tbd-backend",
-                  "title": "concise sub-issue title describing the work for this repo",
+                  "title": "concise title describing the work for this repo",
                   "description": "detailed description of what needs to be done in this repo",
                   "assignee": "github username per assignment rules"
                 }
               ],
               "reasoning": "brief explanation of your triage decision",
-              "isSingleRepo": true/false,
-              "isSingleTask": true/false
+              "isSingleRepo": true/false
             }`;
 
             const leastBusyFrontendDev = await getLeastBusyFrontendDev();
@@ -312,14 +428,81 @@ jobs:
               const [owner, repoName] = repoFull.split('/');
               const labels = content.labels?.nodes?.map(l => l.name) || [];
               const priority = item.priority?.name || 'Medium';
+              const priorityLabel = `priority:${priority.toLowerCase()}`;
+              const issueKindLabel = labels.includes('feature') ? 'feature' : 'bug';
 
               console.log(`\nTriaging #${issueNum}: ${content.title}`);
 
-              // Check retry count from existing comments
-              const comments = await github.rest.issues.listComments({
-                owner, repo: repoName, issue_number: issueNum, per_page: 10
+              // Idempotency: skip if intake issue is already closed
+              if (content.state && content.state !== 'OPEN') {
+                console.log(`  Skipping — intake issue is ${content.state}`);
+                continue;
+              }
+
+              // Fetch latest 5 comments — used for both retry-count and CodeRabbit dupe pre-check
+              const recentComments = await github.rest.issues.listComments({
+                owner, repo: repoName, issue_number: issueNum, per_page: 5,
+                sort: 'created', direction: 'desc'
               });
-              const retryCount = comments.data.filter(c =>
+
+              // === PRE-DEDUPE: CodeRabbit "Possible Duplicate Issue(s)" ===
+              let dupeHit = null;
+              for (const c of recentComments.data) {
+                if (c.user?.login === 'coderabbitai' && c.body?.includes('Possible Duplicate Issue')) {
+                  const dupeNums = parseCodeRabbitDupes(c.body);
+                  for (const n of dupeNums) {
+                    if (n === issueNum) continue;
+                    try {
+                      const dupe = await github.rest.issues.get({
+                        owner: 'TractionBD', repo: 'bd4-intake', issue_number: n
+                      });
+                      if (dupe.data.state === 'closed') {
+                        dupeHit = n;
+                        break;
+                      }
+                    } catch (_) { /* ignore */ }
+                  }
+                  if (dupeHit) break;
+                }
+              }
+              if (dupeHit) {
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum,
+                  body: `🔁 **Skipped triage** — possible duplicate of bd4-intake#${dupeHit} which is already closed. If this is a real recurrence, please re-open with new details.`
+                });
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo: repoName, issue_number: issueNum, labels: ['triaged']
+                  });
+                } catch (_) { /* ignore */ }
+                if (content.state === 'OPEN') {
+                  try { await closeIssueAsNotPlanned(content.id); } catch (_) { /* ignore */ }
+                }
+                summary.skipped_duplicate++;
+                console.log(`  Skipped — CodeRabbit dupe of #${dupeHit}`);
+                continue;
+              }
+
+              // === VERIFY-AGAINST-SHIPPED-CODE: recent merged PR match ===
+              const prMatch = await findRecentMergedPRMatch(content.title);
+              if (prMatch) {
+                const mergedDate = (prMatch.merged_at || '').slice(0, 10);
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum,
+                  body: `⚠️ **Possible already-fixed bug** — recent merged PR may address this: TractionBD/${prMatch.repo}#${prMatch.number} "${prMatch.title}" (merged ${mergedDate}). Please verify on the latest deploy and close if resolved.`
+                });
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo: repoName, issue_number: issueNum, labels: ['triaged']
+                  });
+                } catch (_) { /* ignore */ }
+                summary.skipped_already_fixed++;
+                console.log(`  Flagged as possibly already fixed by ${prMatch.repo}#${prMatch.number}`);
+                continue;
+              }
+
+              // === RETRY-COUNT GUARD ===
+              const retryCount = recentComments.data.filter(c =>
                 c.body?.includes('Auto-triage failed') && c.user?.login === 'github-actions[bot]'
               ).length;
 
@@ -328,7 +511,7 @@ jobs:
                 continue;
               }
 
-              // Call LLM
+              // === LLM CALL ===
               let triage;
               try {
                 const userPrompt = `Issue #${issueNum}: ${content.title}
@@ -349,6 +532,24 @@ jobs:
                   owner, repo: repoName, issue_number: issueNum,
                   body: `⚠️ **Auto-triage failed** (attempt ${retryCount + 1}/${MAX_RETRIES}) — ${e.message}\n\nWill retry on next cycle.`
                 });
+                summary.errored++;
+                continue;
+              }
+
+              // === DESIGN-NEEDED KICKBACK (no tbd-design sub-issues) ===
+              if (triage.needsDesign && !triage.designAttached) {
+                await setStatus(item.id, 'Design');
+                await github.rest.issues.createComment({
+                  owner, repo: repoName, issue_number: issueNum,
+                  body: `📐 Needs design specs before development can start. Moving to Design status. Please attach Figma links or design specs in a comment, then move back to Triage.`
+                });
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo: repoName, issue_number: issueNum, labels: ['triaged']
+                  });
+                } catch (_) { /* ignore */ }
+                summary.kicked_to_design++;
+                console.log(`  Kicked to Design (needs design, none attached)`);
                 continue;
               }
 
@@ -356,11 +557,6 @@ jobs:
               if (!triage.readiness?.ready) {
                 const issues = triage.readiness?.issues?.join('\n- ') || 'Unknown readiness issues';
                 let comment = `🔍 **Readiness check failed** — this item needs attention before it can move to Ready:\n\n- ${issues}\n\n`;
-
-                if (triage.needsDesign && !triage.designAttached) {
-                  comment += `📐 **Design needed but not attached.** Please add Figma/mockup links, or comment "no design needed" if this is intentional.\n\n`;
-                }
-
                 comment += `**AI reasoning:** ${triage.reasoning}\n\n---\n*Once the issues above are resolved, the next triage cycle will re-evaluate this item.*`;
 
                 await github.rest.issues.createComment({
@@ -369,6 +565,7 @@ jobs:
 
                 await notifySlack(`🔍 *Readiness check failed*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Issues:* ${triage.readiness.issues.join(', ')}`);
 
+                summary.readiness_failed++;
                 console.log(`  Readiness failed: ${triage.readiness.issues.join(', ')}`);
                 // Leave in Triage — don't add 'triaged' label so it gets re-checked
                 continue;
@@ -381,70 +578,131 @@ jobs:
                   body: `🔍 **Needs human triage** — AI confidence is low.\n\n**Reasoning:** ${triage.reasoning}\n\n**Best guess:**\n${triage.repos.map(r => `- \`${r.repo}\`: ${r.title} (${r.assignee})`).join('\n')}\n\nPlease review and confirm, or triage manually.`
                 });
                 await notifySlack(`🔍 *Low confidence triage*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}`);
+                summary.low_confidence++;
                 console.log(`  Low confidence — flagged for human review`);
                 continue;
               }
 
-              // === CREATE SUB-ISSUES ===
-              const subIssueLinks = [];
-              const priorityLabel = `priority:${priority.toLowerCase()}`;
-
-              if (triage.isSingleTask) {
-                // Single-task item: keep in bd4-intake with tracking label, assign directly
-                const assignee = triage.repos[0]?.assignee;
-                if (assignee) {
-                  await github.rest.issues.addAssignees({
-                    owner, repo: repoName, issue_number: issueNum, assignees: [assignee]
-                  });
-                }
-                await github.rest.issues.addLabels({
-                  owner, repo: repoName, issue_number: issueNum,
-                  labels: ['triaged', 'tracking']
-                });
-                subIssueLinks.push(`Single-task item — assigned to @${assignee}, no sub-issues needed.`);
-              } else {
-                // Multi-task: create sub-issues in target repos
-                for (const sub of triage.repos) {
+              // === STRUCTURAL SINGLE-REPO PATH (canonical issue + close intake) ===
+              if (triage.repos && triage.repos.length === 1) {
+                const target = triage.repos[0];
+                try {
                   const created = await createCrossRepoIssue(
-                    sub.repo,
-                    sub.title,
-                    `Parent: TractionBD/bd4-intake#${issueNum}\n\n${sub.description}\n\n---\n*Auto-triaged from [bd4-intake#${issueNum}](https://github.com/${repoFull}/issues/${issueNum})*`,
-                    ['bug', priorityLabel],
-                    sub.assignee ? [sub.assignee] : []
+                    target.repo,
+                    target.title,
+                    `Original intake: TractionBD/bd4-intake#${issueNum}\n\n${target.description}\n\n---\n*Auto-triaged from [bd4-intake#${issueNum}](https://github.com/${repoFull}/issues/${issueNum})*`,
+                    [issueKindLabel, priorityLabel, 'tracking'],
+                    target.assignee ? [target.assignee] : []
                   );
-                  subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title} (@${sub.assignee})`);
 
-                  // Add sub-issue to project with Ready status
+                  await addToProjectAndSetFields(created.node_id, 'Ready', priority);
+
+                  const provider = process.env.LLM_PROVIDER || 'openai';
+                  await github.rest.issues.createComment({
+                    owner, repo: repoName, issue_number: issueNum,
+                    body: `✅ **Auto-triaged** (confidence: ${triage.confidence}) — single-repo item.\n\n**Reasoning:** ${triage.reasoning}\n\n**Canonical issue:** TractionBD/${target.repo}#${created.number} — ${target.title}\n\nThis intake issue is being closed; all further work and discussion should happen on the canonical issue linked above.\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`
+                  });
+
+                  // Add 'triaged' to intake (NOT 'tracking' — canonical owns that)
                   try {
-                    await addToProjectWithStatus(created.node_id, 'Ready', priority);
-                  } catch (e) {
-                    console.log(`  Warning: couldn't add ${sub.repo}#${created.number} to project: ${e.message}`);
-                  }
-                }
+                    await github.rest.issues.addLabels({
+                      owner, repo: repoName, issue_number: issueNum, labels: ['triaged']
+                    });
+                  } catch (_) { /* ignore */ }
 
-                // Update intake issue: add tracking label, triaged label
-                await github.rest.issues.addLabels({
-                  owner, repo: repoName, issue_number: issueNum,
-                  labels: ['triaged', 'tracking']
-                });
+                  await closeIssueAsNotPlanned(content.id);
+
+                  await notifySlack(`✅ *Issue auto-triaged (single-repo)*\n*Intake:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Canonical:* TractionBD/${target.repo}#${created.number}`);
+
+                  summary.triaged++;
+                  console.log(`  Triaged single-repo → ${target.repo}#${created.number}, intake closed`);
+                } catch (e) {
+                  console.log(`  Error in single-repo path: ${e.message}`);
+                  summary.errored++;
+                }
+                continue;
               }
 
-              // Post triage comment
+              // === MULTI-REPO PATH (parent + sub-issues) ===
+              // Idempotency: if sub-issues already exist referencing this intake, skip creation
+              let existingSubIssues = [];
+              try {
+                const search = await github.rest.search.issuesAndPullRequests({
+                  q: `org:TractionBD "bd4-intake#${issueNum}" in:body is:issue`,
+                  per_page: 30
+                });
+                existingSubIssues = (search.data.items || []).filter(i =>
+                  i.repository_url && !i.repository_url.endsWith('/bd4-intake')
+                );
+              } catch (e) {
+                console.log(`  Sub-issue search failed: ${e.message}`);
+              }
+
+              const subIssueLinks = [];
+              if (existingSubIssues.length > 0) {
+                console.log(`  Sub-issues already exist (${existingSubIssues.length}) — syncing labels/status only`);
+                for (const ex of existingSubIssues) {
+                  subIssueLinks.push(`- TractionBD/${ex.repository_url.split('/').pop()}#${ex.number} — ${ex.title}`);
+                  if (ex.node_id) {
+                    await addToProjectAndSetFields(ex.node_id, 'Ready', priority);
+                  }
+                }
+              } else {
+                for (const sub of triage.repos) {
+                  try {
+                    const created = await createCrossRepoIssue(
+                      sub.repo,
+                      sub.title,
+                      `Parent: TractionBD/bd4-intake#${issueNum}\n\n${sub.description}\n\n---\n*Auto-triaged from [bd4-intake#${issueNum}](https://github.com/${repoFull}/issues/${issueNum})*`,
+                      [issueKindLabel, priorityLabel],
+                      sub.assignee ? [sub.assignee] : []
+                    );
+                    subIssueLinks.push(`- [ ] TractionBD/${sub.repo}#${created.number} — ${sub.title} (@${sub.assignee})`);
+                    await addToProjectAndSetFields(created.node_id, 'Ready', priority);
+                  } catch (e) {
+                    console.log(`  Warning: couldn't create/add sub-issue in ${sub.repo}: ${e.message}`);
+                  }
+                }
+              }
+
+              // Update intake (parent tracking) issue: tracking + triaged labels
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo: repoName, issue_number: issueNum,
+                  labels: ['triaged', 'tracking']
+                });
+              } catch (_) { /* ignore */ }
+
+              // Ensure parent tracking is on the board with Status + Priority
+              await addToProjectAndSetFields(content.id, 'Ready', priority);
+
               const provider = process.env.LLM_PROVIDER || 'openai';
-              const triageComment = triage.isSingleTask
-                ? `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n${subIssueLinks[0]}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`
-                : `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
+              const triageComment = `✅ **Auto-triaged** (confidence: ${triage.confidence})\n\n**Reasoning:** ${triage.reasoning}\n\n## Sub-issues\n${subIssueLinks.join('\n')}\n\n---\n*Triaged by AI (${provider === 'anthropic' ? 'Claude' : 'GPT-4o'})*`;
 
               await github.rest.issues.createComment({
                 owner, repo: repoName, issue_number: issueNum, body: triageComment
               });
 
-              // Move to Ready
+              // Move parent to Ready
               await setStatus(item.id, 'Ready');
-              console.log(`  Triaged → Ready (${triage.repos.length} repo(s), confidence: ${triage.confidence})`);
+              summary.triaged++;
+              console.log(`  Triaged multi-repo → ${triage.repos.length} sub-issue(s), confidence: ${triage.confidence}`);
 
-              // Notify Slack
-              await notifySlack(`✅ *Issue auto-triaged*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Sub-issues:* ${triage.repos.map(r => `\`${r.repo}\`: ${r.title}`).join(', ')}`);
+              await notifySlack(`✅ *Issue auto-triaged (multi-repo)*\n*Issue:* <${`https://github.com/${repoFull}/issues/${issueNum}`}|${repoFull}#${issueNum}> — ${content.title}\n*Sub-issues:* ${triage.repos.map(r => `\`${r.repo}\`: ${r.title}`).join(', ')}`);
             }
 
-            console.log('\nEnhanced triage complete.');
+            // === RUN SUMMARY ===
+            const total = Object.values(summary).reduce((a, b) => a + b, 0);
+            if (total > 0) {
+              await notifySlack(
+                `🤖 *Enhanced Triage run complete*\n` +
+                `Triaged: ${summary.triaged} · ` +
+                `Kicked to Design: ${summary.kicked_to_design} · ` +
+                `Skipped (duplicate): ${summary.skipped_duplicate} · ` +
+                `Skipped (already-fixed): ${summary.skipped_already_fixed} · ` +
+                `Low confidence: ${summary.low_confidence} · ` +
+                `Readiness failed: ${summary.readiness_failed} · ` +
+                `Errored: ${summary.errored}`
+              );
+            }
+            console.log('\nEnhanced triage complete.', JSON.stringify(summary));

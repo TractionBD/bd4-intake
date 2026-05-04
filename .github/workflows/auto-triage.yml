@@ -165,52 +165,49 @@ jobs:
 
             const provider = process.env.LLM_PROVIDER || 'openai';
 
-            const SYSTEM_PROMPT = `You are a triage assistant for BD4, a professional CRM mobile app.
+            const SYSTEM_PROMPT = [
+              'You are a triage assistant for BD4, a professional CRM mobile app.',
+              '',
+              'Classify each issue as simple or complex.',
+              '',
+              'SIMPLE (no sub-issues):',
+              '- Any bug - bugs are ALWAYS simple, never complex',
+              '- Small, well-scoped feature that one developer can implement end-to-end',
+              '- Clear scope from description alone',
+              '',
+              'COMPLEX (use phases - features only, never bugs):',
+              '- Large feature requiring distinct sequential work stages that different people own at different times',
+              '- Example phases: "Phase 1: Design & Spec", "Phase 2: Backend API", "Phase 3: Mobile UI"',
+              '- Only split into phases when there are genuine sequential dependencies',
+              '- Minimum 3+ phases to qualify as complex; if you are not sure, default to simple',
+              '',
+              'ASSIGNMENT:',
+              '- Backend/API work -> "kul-pointe"',
+              '- Mobile UI work -> use the frontend dev specified in the prompt',
+              '- Design-needed -> "sreenidhi-proddesign"',
+              '- Mixed feature (multiple areas) -> assign to whoever does Phase 1',
+              '',
+              'DESIGN CHECK:',
+              '- needsDesign: true only for NEW screens, NEW UI flows, or significant layout redesigns',
+              '- Bug fixes, text changes, API work -> needsDesign: false',
+              '- designAttached: true if Figma links or mockups are present in the description',
+              '',
+              'Respond with ONLY valid JSON, no markdown fences:',
+              '{',
+              '  "complexity": "simple" | "complex",',
+              '  "needsDesign": true | false,',
+              '  "designAttached": true | false,',
+              '  "confidence": "high" | "medium" | "low",',
+              '  "primaryAssignee": "github-username",',
+              '  "reasoning": "one concise sentence",',
+              '  "phases": [',
+              '    { "title": "Phase N: short name", "description": "what needs to be done", "assignee": "github-username" }',
+              '  ]',
+              '}',
+              'Note: "phases" is only required when complexity === "complex". Omit or use [] when simple.'
+            ].join('\n');
 
-Classify each issue as simple or complex.
-
-SIMPLE (no sub-issues):
-- Any bug — bugs are ALWAYS simple, never complex
-- Small, well-scoped feature that one developer can implement end-to-end
-- Clear scope from description alone
-
-COMPLEX (use phases — features only, never bugs):
-- Large feature requiring distinct sequential work stages that different people own at different times
-- Example phases: "Phase 1: Design & Spec", "Phase 2: Backend API", "Phase 3: Mobile UI"
-- Only split into phases when there are genuine sequential dependencies
-- Minimum 3+ phases to qualify as complex; if you're not sure, default to simple
-
-ASSIGNMENT:
-- Backend/API work → "kul-pointe"
-- Mobile UI work → use the frontend dev specified in the prompt
-- Design-needed → "sreenidhi-proddesign"
-- Mixed feature (multiple areas) → assign to whoever does Phase 1
-
-DESIGN CHECK:
-- needsDesign: true only for NEW screens, NEW UI flows, or significant layout redesigns
-- Bug fixes, text changes, API work → needsDesign: false
-- designAttached: true if Figma links or mockups are present in the description
-
-Respond with ONLY valid JSON, no markdown fences:
-{
-  "complexity": "simple" | "complex",
-  "needsDesign": true | false,
-  "designAttached": true | false,
-  "confidence": "high" | "medium" | "low",
-  "primaryAssignee": "github-username",
-  "reasoning": "one concise sentence",
-  "phases": [
-    { "title": "Phase N: short name", "description": "what needs to be done", "assignee": "github-username" }
-  ]
-}
-Note: "phases" is only required when complexity === "complex". Omit or use [] when simple.`;
-
-            const USER_PROMPT = `Issue #${issue.number}: ${title}
-Type: ${isFeature ? 'feature request' : 'bug report'}
-Frontend dev to use if needed: ${leastBusyFrontendDev}
-
-Description:
-${body}`;
+            const USER_PROMPT = `Issue #${issue.number}: ${title}\nType: ${isFeature ? 'feature request' : 'bug report'}\nFrontend dev to use if needed: ${leastBusyFrontendDev}\n\nDescription:\n${body}`;
 
             let triage;
             try {

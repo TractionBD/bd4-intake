@@ -1,7 +1,7 @@
 name: Feature Request
 description: Suggest a new feature or enhancement for BD4
 title: "[Feature]: "
-labels: ["feature", "needs-triage", "tracking"]
+labels: ["feature", "needs-triage"]
 body:
   - type: markdown
     attributes:

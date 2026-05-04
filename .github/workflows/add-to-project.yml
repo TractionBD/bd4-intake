@@ -1,0 +1,44 @@
+name: Add New Issue to BD4 Project
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add to BD4 project at Triage
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+          script: |
+            const PROJECT_ID = 'PVT_kwDODvlY_84BRmQU';
+            const STATUS_FIELD_ID = 'PVTSSF_lADODvlY_84BRmQUzg_YSso';
+            const TRIAGE_OPTION_ID = 'f0a0aebb';
+            const issue = context.payload.issue;
+            try {
+              const addRes = await github.graphql(`
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                    item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, contentId: issue.node_id });
+              const itemId = addRes.addProjectV2ItemById.item.id;
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId, itemId: $itemId,
+                    fieldId: $fieldId, value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }
+              `, { projectId: PROJECT_ID, itemId, fieldId: STATUS_FIELD_ID, optionId: TRIAGE_OPTION_ID });
+              console.log(`Added issue #${issue.number} to BD4 project at Triage`);
+            } catch (e) {
+              console.log(`Failed to add to project: ${e.message}`);
+            }
